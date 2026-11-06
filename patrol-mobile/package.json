@@ -1,15 +1,20 @@
 {
   "name": "patrol-mobile",
-  "description": "The Blank project template includes the minimum dependencies to run and an empty root component.",
+  "description": "Guard patrol app (iOS, Android, web preview) with a manager dashboard and a local API server.",
   "license": "0BSD",
   "version": "55.1.39",
   "main": "index.ts",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
     "server": "node server/server.mjs",
+    "create-manager": "node server/server.mjs --create-manager",
+    "typecheck": "tsc --noEmit",
     "build:web": "expo export --platform web"
   },
   "dependencies": {

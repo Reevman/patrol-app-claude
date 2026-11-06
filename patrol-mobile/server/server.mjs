@@ -10,6 +10,7 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 const db = new DatabaseSync(resolve(dataDir, 'patrol.sqlite'));
 db.exec(`
   PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
   CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
   CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS points (id TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -35,6 +36,9 @@ if (process.argv.includes('--create-manager')) {
   const password = process.env.PATROL_MANAGER_PASSWORD;
   if (!validEmail(email) || !validPassword(password)) {
     throw new Error('Set PATROL_MANAGER_EMAIL and PATROL_MANAGER_PASSWORD (12–128 characters).');
+  }
+  if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) {
+    throw new Error('An account with that email already exists.');
   }
   db.prepare("INSERT INTO users (id, name, email, password, role) VALUES (?, ?, ?, ?, 'manager')")
     .run(randomUUID(), process.env.PATROL_MANAGER_NAME?.trim() || 'Site manager', email, passwordHash(password));
@@ -118,6 +122,7 @@ export async function api(req, path) {
     if (!user || !timingSafeEqual(Buffer.from(actual), Buffer.from(expected)) || !validPassword(input.password)) {
       fail(401, 'Email or password is incorrect.');
     }
+    attempts.delete(address);
     const token = randomBytes(32).toString('hex');
     db.prepare('DELETE FROM sessions WHERE expires <= ?').run(now);
     db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(digest(token), user.id, now + 12 * 3600000);
@@ -134,7 +139,7 @@ export async function api(req, path) {
   if (user.role === 'manager') {
     if (req.method !== 'POST') fail(404, 'Action not found.');
     const input = await body(req);
-    session(req);
+    session(req); // re-check the session after the body was read
     switch (path) {
       case '/api/guards/add': {
         const email = emailOf(input.email);
@@ -144,9 +149,13 @@ export async function api(req, path) {
           .run(randomUUID(), field(input.name, 100), email, passwordHash(input.password));
         break;
       }
-      case '/api/guards/remove':
-        db.prepare("UPDATE users SET active = 0 WHERE id = ? AND role = 'guard'").run(field(input.id, 100));
+      case '/api/guards/remove': {
+        const id = field(input.id, 100);
+        const result = db.prepare("UPDATE users SET active = 0 WHERE id = ? AND role = 'guard' AND active = 1").run(id);
+        if (!result.changes) fail(404, 'Guard not found.');
+        db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id); // revoke access immediately
         break;
+      }
       case '/api/points/add': {
         const name = field(input.name, 100);
         if (points().some(point => point.name.toLowerCase() === name.toLowerCase())) fail(409, 'That checkpoint already exists.');
@@ -154,7 +163,7 @@ export async function api(req, path) {
         break;
       }
       case '/api/points/remove':
-        db.prepare('DELETE FROM points WHERE id = ?').run(field(input.id, 100));
+        if (!db.prepare('DELETE FROM points WHERE id = ?').run(field(input.id, 100)).changes) fail(404, 'Checkpoint not found.');
         break;
       case '/api/settings':
         if (!Number.isInteger(input.interval) || input.interval < 1 || input.interval > 1440) fail(400, 'Enter 1 to 1440 minutes.');
@@ -162,7 +171,7 @@ export async function api(req, path) {
         break;
       case '/api/reports/status':
         if (!['New', 'Acknowledged', 'Resolved'].includes(input.status)) fail(400, 'Invalid report status.');
-        db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(input.status, field(input.id, 100));
+        if (!db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(input.status, field(input.id, 100)).changes) fail(404, 'Report not found.');
         break;
       default: fail(404, 'Action not found.');
     }
@@ -206,17 +215,28 @@ export async function api(req, path) {
   fail(403, 'This action requires manager access.');
 }
 
-const types = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json', '.ico': 'image/x-icon', '.png': 'image/png' };
+const types = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.json': 'application/json',
+  '.css': 'text/css', '.ico': 'image/x-icon', '.png': 'image/png', '.svg': 'image/svg+xml',
+  '.ttf': 'font/ttf', '.map': 'application/json',
+};
 if (import.meta.main) createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
   try {
     const path = new URL(req.url, 'http://localhost').pathname;
     if (path.startsWith('/api/')) return json(res, 200, await api(req, path));
     if (req.method !== 'GET') fail(405, 'Method not allowed.');
-    const file = resolve(webDir, '.' + (path === '/' ? '/index.html' : decodeURIComponent(path)));
+    let relative;
+    try { relative = decodeURIComponent(path); } catch { fail(400, 'Bad request.'); }
+    const file = resolve(webDir, '.' + (relative === '/' ? '/index.html' : relative));
     if (!file.startsWith(webDir + sep) || !statSync(file, { throwIfNoEntry: false })?.isFile()) fail(404, 'Page not found.');
-    res.writeHead(200, { 'Content-Type': types[extname(file)] || 'application/octet-stream' });
+    const type = types[extname(file)] || 'application/octet-stream';
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Cache-Control': type.startsWith('text/html') ? 'no-cache' : 'public, max-age=3600',
+    });
     createReadStream(file).pipe(res);
   } catch (error) {
     if (!error.status) console.error(error);

@@ -19,10 +19,20 @@ async function loadNotifications() {
 }
 
 export async function hasPatrolReminder() {
-  if (!supportsPatrolNotifications) return false;
+  return (await getPatrolReminder()).enabled;
+}
+
+/** Reports whether the reminder is scheduled and, when the platform exposes it, its interval in minutes. */
+export async function getPatrolReminder(): Promise<{ enabled: boolean; minutes: number | null }> {
+  if (!supportsPatrolNotifications) return { enabled: false, minutes: null };
   const notifications = await loadNotifications();
   const scheduled = await notifications.getAllScheduledNotificationsAsync();
-  return scheduled.some(request => request.identifier === reminderId);
+  const request = scheduled.find(item => item.identifier === reminderId);
+  const seconds = (request?.trigger as unknown as { seconds?: unknown } | null | undefined)?.seconds;
+  return {
+    enabled: Boolean(request),
+    minutes: typeof seconds === 'number' ? Math.round(seconds / 60) : null,
+  };
 }
 
 export async function schedulePatrolReminder(requestPermission: boolean, intervalMinutes: number) {
